@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Magnet → Torrent</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --fg: #1b1f24; --muted: #6b7280;
+    --border: #d9dde3; --accent: #2563eb; --ok: #15803d; --err: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115; --card: #171a21; --fg: #e6e8eb; --muted: #9aa3ae;
+      --border: #2a2f39; --accent: #60a5fa; --ok: #4ade80; --err: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 40px 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 24px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  textarea {
+    width: 100%; min-height: 90px; resize: vertical; padding: 10px;
+    font: 13px/1.4 ui-monospace, Menlo, monospace; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+  button {
+    padding: 9px 16px; border-radius: 8px; border: 1px solid var(--accent);
+    background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  label.opt { color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; }
+  #status { margin-top: 16px; font-size: 14px; }
+  #status .ok { color: var(--ok); } #status .err { color: var(--err); }
+  .meta { margin-top: 12px; font-size: 13px; color: var(--muted); word-break: break-all; }
+  .meta b { color: var(--fg); font-weight: 600; }
+  .spinner {
+    display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px;
+    border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #fallback { display: none; margin-top: 16px; font-size: 14px; }
+  #fallback a { color: var(--accent); }
+  details { margin-top: 24px; color: var(--muted); font-size: 13px; }
+  summary { cursor: pointer; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Magnet → .torrent</h1>
+  <p class="sub">Vlož magnet link. Stránka stáhne metadata od peerů (WebTorrent) a nabídne <code>.torrent</code> soubor ke stažení.</p>
+
+  <div class="card">
+    <textarea id="magnet" placeholder="magnet:?xt=urn:btih:..." spellcheck="false"></textarea>
+    <div class="row">
+      <button id="go">Získat .torrent</button>
+      <button id="cancel" class="ghost" disabled>Zrušit</button>
+      <label class="opt"><input type="checkbox" id="addTrackers" checked> přidat WebRTC trackery</label>
+    </div>
+    <div id="status"></div>
+    <div id="info" class="meta"></div>
+    <div id="fallback">
+      Nedaří se? Zkus torrent cache (otevře se v nové záložce):
+      <span id="fallbackLinks"></span>
+    </div>
+  </div>
+
+  <details>
+    <summary>Jak to funguje a omezení</summary>
+    <p>Magnet link obsahuje jen hash; seznam souborů (metadata) se musí stáhnout od jiných klientů. Prohlížeč umí mluvit jen s peery přes WebRTC (WebTorrent, např. webtorrent.io, Brave, qBittorrent 5+ s WebRTC). U klasických torrentů, kde nikdo WebRTC nesdílí, metadata nepřijdou — pak zkus odkazy na cache nebo otevři magnet přímo v klientovi (qBittorrent/Transmission ho umí uložit jako .torrent).</p>
+    <p>Po získání metadat se torrent hned zastaví — obsah se nestahuje.</p>
+  </details>
+</main>
+
+<script type="module">
+import WebTorrent from 'https://cdn.jsdelivr.net/npm/webtorrent@2.5.1/dist/webtorrent.min.js';
+
+const WS_TRACKERS = [
+  'wss://tracker.openwebtorrent.com',
+  'wss://tracker.webtorrent.dev',
+];
+const TIMEOUT_MS = 90_000;
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status'), infoEl = $('info');
+let client = null, timer = null;
+
+function setStatus(html) { statusEl.innerHTML = html; }
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function parseMagnet(str) {
+  str = str.trim();
+  // allow a bare 40-hex / 32-base32 info hash
+  if (/^[0-9a-f]{40}$/i.test(str) || /^[a-z2-7]{32}$/i.test(str)) str = 'magnet:?xt=urn:btih:' + str;
+  if (!str.startsWith('magnet:?')) return null;
+  const params = new URLSearchParams(str.slice(8));
+  const xt = params.getAll('xt').find(x => x.toLowerCase().startsWith('urn:btih:'));
+  if (!xt) return null;
+  let hash = xt.slice(9);
+  if (hash.length === 32) hash = base32ToHex(hash);
+  if (!/^[0-9a-f]{40}$/i.test(hash)) return null;
+  return { uri: str, hash: hash.toUpperCase(), name: params.get('dn') };
+}
+
+function base32ToHex(s) {
+  const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = '';
+  for (const c of s.toUpperCase()) bits += alpha.indexOf(c).toString(2).padStart(5, '0');
+  let hex = '';
+  for (let i = 0; i + 4 <= bits.length; i += 4) hex += parseInt(bits.slice(i, i + 4), 2).toString(16);
+  return hex;
+}
+
+function fmtSize(n) {
+  const u = ['B','KB','MB','GB','TB']; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+}
+
+function showFallback(hash) {
+  const links = [
+    ['itorrents.org', `https://itorrents.org/torrent/${hash}.torrent`],
+    ['torrage', `https://torrage.info/torrent.php?h=${hash}`],
+    ['btcache', `https://btcache.me/torrent/${hash}`],
+  ];
+  $('fallbackLinks').innerHTML = links.map(([n, u]) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${n}</a>`).join(' · ');
+  $('fallback').style.display = 'block';
+}
+
+function cleanup() {
+  clearTimeout(timer); timer = null;
+  if (client) { client.destroy(); client = null; }
+  $('go').disabled = false; $('cancel').disabled = true;
+}
+
+function download(bytes, filename) {
+  const blob = new Blob([bytes], { type: 'application/x-bittorrent' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+}
+
+$('go').addEventListener('click', () => {
+  const m = parseMagnet($('magnet').value);
+  infoEl.textContent = ''; $('fallback').style.display = 'none';
+  if (!m) { setStatus('<span class="err">Neplatný magnet link.</span>'); return; }
+  if (!window.crypto?.subtle) {
+    setStatus('<span class="err">Prohlížeč tu nemá Web Crypto (nezabezpečený kontext). Otevři stránku přes file://, https:// nebo localhost.</span>');
+    return;
+  }
+
+  cleanup();
+  $('go').disabled = true; $('cancel').disabled = false;
+  infoEl.innerHTML = `<b>Hash:</b> ${m.hash}${m.name ? `<br><b>Název:</b> ${esc(m.name)}` : ''}`;
+  setStatus('<span class="spinner"></span>Hledám peery a stahuji metadata…');
+  showFallback(m.hash);
+
+  client = new WebTorrent();
+  client.on('error', e => { setStatus(`<span class="err">Chyba: ${esc(e.message || e)}</span>`); cleanup(); });
+
+  const opts = { announce: $('addTrackers').checked ? WS_TRACKERS : [] };
+  const torrent = client.add(m.uri, opts);
+
+  torrent.on('wire', () => {
+    if (timer) setStatus(`<span class="spinner"></span>Připojeno peerů: ${torrent.numPeers}, čekám na metadata…`);
+  });
+
+  torrent.on('metadata', () => {
+    const bytes = torrent.torrentFile;
+    const name = (torrent.name || m.name || m.hash).replace(/[\\/:*?"<>|]+/g, '_');
+    const total = torrent.files.reduce((s, f) => s + f.length, 0);
+    infoEl.innerHTML = `<b>Hash:</b> ${m.hash}<br><b>Název:</b> ${esc(torrent.name)}<br>` +
+      `<b>Souborů:</b> ${torrent.files.length} · <b>Velikost:</b> ${fmtSize(total)}`;
+    download(bytes, name + '.torrent');
+    setStatus(`<span class="ok">Hotovo — ${esc(name)}.torrent staženo.</span> ` +
+      `<button class="ghost" id="again">Stáhnout znovu</button>`);
+    $('again').onclick = () => download(bytes, name + '.torrent');
+    $('fallback').style.display = 'none';
+    cleanup();
+  });
+
+  timer = setTimeout(() => {
+    setStatus('<span class="err">Metadata nepřišla do 90 s — žádný WebRTC peer. Zkus cache níže nebo torrent klienta.</span>');
+    cleanup();
+  }, TIMEOUT_MS);
+});
+
+$('cancel').addEventListener('click', () => { setStatus('Zrušeno.'); cleanup(); });
+$('magnet').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) $('go').click(); });
+</script>
+</body>
+</html>
